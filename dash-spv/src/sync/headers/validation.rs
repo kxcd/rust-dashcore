@@ -1,6 +1,7 @@
 //! Header validation functionality.
 
 use dashcore::error::Error as DashError;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::time::Instant;
 
 use crate::error::{ValidationError, ValidationResult};
@@ -20,6 +21,11 @@ pub fn validate_headers(headers: &[CachedHeader], mode: ValidationMode) -> Valid
 
     let start = Instant::now();
 
+    // Pre-calculate cached block hashes in parallel
+    headers.par_iter().for_each(|header| {
+        header.block_hash();
+    });
+
     let mut prev_header_hash = None;
     for header in headers {
         // Check chain continuity if we have previous header
@@ -30,9 +36,12 @@ pub fn validate_headers(headers: &[CachedHeader], mode: ValidationMode) -> Valid
                 ));
             }
         }
+        prev_header_hash = Some(header.block_hash());
+    }
 
-        if mode == ValidationMode::Full {
-            // Validate proof of work with X11 hashing
+    if mode == ValidationMode::Full {
+        // Parallelized proof of work validation
+        headers.par_iter().try_for_each(|header| {
             let target = header.target();
             if let Err(e) = header.validate_pow(target) {
                 return match e {
@@ -46,9 +55,8 @@ pub fn validate_headers(headers: &[CachedHeader], mode: ValidationMode) -> Valid
                     ))),
                 };
             }
-        }
-
-        prev_header_hash = Some(header.block_hash());
+            Ok(())
+        })?;
     }
 
     tracing::debug!(
