@@ -31,5 +31,8 @@ pub use manager::DiskStorageManager;
 /// Number of headers per segment file
 pub(super) const HEADERS_PER_SEGMENT: u32 = 50_000;
 
+/// Number of filters per segment file
+pub(super) const FILTERS_PER_SEGMENT: u32 = 50_000;
+
 /// Maximum number of segments to keep in memory
 pub(super) const MAX_ACTIVE_SEGMENTS: usize = 10;
