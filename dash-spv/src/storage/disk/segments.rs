@@ -262,6 +262,125 @@ pub(super) async fn evict_oldest_filter_segment(
     Ok(())
 }
 
+/// Maximum active filter data segments (lower than headers due to larger memory footprint)
+const MAX_ACTIVE_FILTER_DATA_SEGMENTS: usize = 5;
+
+/// Ensure a filter data segment is loaded in memory.
+pub(super) async fn ensure_filter_data_segment_loaded(
+    manager: &DiskStorageManager,
+    segment_id: u32,
+) -> StorageResult<()> {
+    manager.process_worker_notifications().await;
+
+    let mut segments = manager.active_filter_data_segments.write().await;
+
+    if segments.contains_key(&segment_id) {
+        if let Some(segment) = segments.get_mut(&segment_id) {
+            segment.last_accessed = Instant::now();
+        }
+        return Ok(());
+    }
+
+    // Load segment from disk (combined .seg file format)
+    let segment_path =
+        manager.base_path.join(format!("filters/filter_data_segment_{:04}.seg", segment_id));
+
+    let (index, current_data_size, file_data_offset) = if segment_path.exists() {
+        let (loaded_index, data_offset) = super::io::load_filter_data_index(&segment_path).await?;
+        // Calculate data size from index entries
+        let data_size = loaded_index
+            .iter()
+            .filter(|e| e.length > 0)
+            .map(|e| e.offset + e.length as u64)
+            .max()
+            .unwrap_or(0);
+        (loaded_index, data_size, data_offset)
+    } else {
+        (Vec::new(), 0, 0)
+    };
+
+    let filter_count = index.iter().filter(|e| e.length > 0).count();
+
+    // Evict old segments if needed
+    if segments.len() >= MAX_ACTIVE_FILTER_DATA_SEGMENTS {
+        evict_oldest_filter_data_segment(manager, &mut segments).await?;
+    }
+
+    segments.insert(
+        segment_id,
+        FilterDataSegmentCache {
+            segment_id,
+            index,
+            filters: HashMap::new(),
+            filter_count,
+            current_data_size,
+            file_data_offset,
+            state: SegmentState::Clean,
+            last_saved: Instant::now(),
+            last_accessed: Instant::now(),
+        },
+    );
+
+    Ok(())
+}
+
+/// Evict the oldest (least recently accessed) filter data segment.
+pub(super) async fn evict_oldest_filter_data_segment(
+    manager: &DiskStorageManager,
+    segments: &mut HashMap<u32, FilterDataSegmentCache>,
+) -> StorageResult<()> {
+    if let Some((oldest_id, oldest_segment)) =
+        segments.iter().min_by_key(|(_, s)| s.last_accessed).map(|(id, s)| (*id, s.clone()))
+    {
+        if oldest_segment.state != SegmentState::Clean {
+            tracing::trace!(
+                "Synchronously saving filter data segment {} before eviction (state: {:?})",
+                oldest_segment.segment_id,
+                oldest_segment.state
+            );
+
+            // Reconstruct data from cached filters
+            let data = reconstruct_filter_data(&oldest_segment);
+
+            let segment_path = manager
+                .base_path
+                .join(format!("filters/filter_data_segment_{:04}.seg", oldest_segment.segment_id));
+
+            super::io::save_filter_data_segment(&segment_path, &oldest_segment.index, &data)
+                .await?;
+
+            tracing::debug!(
+                "Successfully saved filter data segment {} to disk",
+                oldest_segment.segment_id
+            );
+        }
+
+        segments.remove(&oldest_id);
+    }
+
+    Ok(())
+}
+
+/// Reconstruct filter data bytes from a segment cache for saving.
+fn reconstruct_filter_data(segment: &FilterDataSegmentCache) -> Vec<u8> {
+    let mut data = vec![0u8; segment.current_data_size as usize];
+
+    for (offset, filter) in &segment.filters {
+        if *offset < segment.index.len() {
+            let entry = &segment.index[*offset];
+            if entry.length > 0 {
+                let start = entry.offset as usize;
+                let end = start + entry.length as usize;
+                if end <= data.len() {
+                    data[start..end].copy_from_slice(filter);
+                }
+            }
+        }
+    }
+
+    data
+}
+
 /// Save all dirty segments to disk via background worker.
 pub(super) async fn save_dirty_segments(manager: &DiskStorageManager) -> StorageResult<()> {
     use super::manager::WorkerCommand;
@@ -326,6 +445,43 @@ pub(super) async fn save_dirty_segments(manager: &DiskStorageManager) -> Storage
         {
             let mut segments = manager.active_filter_segments.write().await;
             for segment_id in &filter_segment_ids_to_mark {
+                if let Some(segment) = segments.get_mut(segment_id) {
+                    segment.state = SegmentState::Saving;
+                    segment.last_saved = Instant::now();
+                }
+            }
+        }
+
+        // Collect filter data segments to save (only dirty ones)
+        let (filter_data_segments_to_save, filter_data_segment_ids_to_mark) = {
+            let segments = manager.active_filter_data_segments.read().await;
+            let to_save: Vec<_> = segments
+                .values()
+                .filter(|s| s.state == SegmentState::Dirty)
+                .map(|s| {
+                    let data = reconstruct_filter_data(s);
+                    (s.segment_id, s.index.clone(), data)
+                })
+                .collect();
+            let ids_to_mark: Vec<_> = to_save.iter().map(|(id, _, _)| *id).collect();
+            (to_save, ids_to_mark)
+        };
+
+        // Send filter data segments to worker
+        for (segment_id, index, data) in filter_data_segments_to_save {
+            let _ = tx
+                .send(WorkerCommand::SaveFilterDataSegment {
+                    segment_id,
+                    index,
+                    data,
+                })
+                .await;
+        }
+
+        // Mark ONLY the filter data segments we're actually saving as Saving
+        {
+            let mut segments = manager.active_filter_data_segments.write().await;
+            for segment_id in &filter_data_segment_ids_to_mark {
                 if let Some(segment) = segments.get_mut(segment_id) {
                     segment.state = SegmentState::Saving;
                     segment.last_saved = Instant::now();
