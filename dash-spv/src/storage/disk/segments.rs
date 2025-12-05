@@ -45,6 +45,44 @@ pub(super) struct FilterSegmentCache {
     pub(super) last_accessed: Instant,
 }
 
+/// Index entry for a single compact block filter in a data segment.
+/// Stores the byte offset and length needed to read the filter from the data file.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FilterDataIndexEntry {
+    /// Byte offset in the data file where this filter starts
+    pub(super) offset: u64,
+    /// Length of the filter data in bytes (0 means no filter stored)
+    pub(super) length: u32,
+}
+
+/// In-memory cache for a segment of compact block filters.
+/// Compact filters have variable length (typically 100 bytes to ~5KB).
+/// We store an index of offsets and cache individual filters on demand.
+#[derive(Clone)]
+pub(super) struct FilterDataSegmentCache {
+    pub(super) segment_id: u32,
+    /// Index entries for each filter position in the segment.
+    /// Position corresponds to (height % FILTERS_PER_SEGMENT).
+    /// Length of 0 indicates no filter stored at that position.
+    /// Offsets are RELATIVE to the data section (not file start).
+    pub(super) index: Vec<FilterDataIndexEntry>,
+    /// Cached filter data, keyed by segment offset.
+    /// Not all filters are cached - loaded on demand.
+    pub(super) filters: HashMap<usize, Vec<u8>>,
+    /// Number of filters stored in this segment
+    pub(super) filter_count: usize,
+    /// Current total size of data written (for calculating next offset)
+    pub(super) current_data_size: u64,
+    /// Byte offset where data section starts in the combined file (for loading filters)
+    pub(super) file_data_offset: u64,
+    /// Segment state
+    pub(super) state: SegmentState,
+    /// Last saved time
+    pub(super) last_saved: Instant,
+    /// Last access time
+    pub(super) last_accessed: Instant,
+}
+
 /// Creates a sentinel header used for padding segments.
 /// This header has invalid values that cannot be mistaken for valid blocks.
 pub(super) fn create_sentinel_header() -> BlockHeader {
