@@ -182,22 +182,126 @@ impl DiskStorageManager {
         Ok(*self.cached_filter_tip_height.read().await)
     }
 
-    /// Store a compact filter.
+    /// Store a compact filter using segmented storage.
     pub async fn store_filter(&mut self, height: u32, filter: &[u8]) -> StorageResult<()> {
-        let path = self.base_path.join(format!("filters/{}.dat", height));
-        tokio::fs::write(path, filter).await?;
+        use super::segments::FilterDataIndexEntry;
+
+        let sync_base_height = *self.sync_base_height.read().await;
+
+        // Convert blockchain height to storage index
+        let storage_index = if sync_base_height > 0 && height >= sync_base_height {
+            height - sync_base_height
+        } else {
+            height
+        };
+
+        let segment_id = Self::get_filter_segment_id(storage_index);
+        let offset = Self::get_filter_segment_offset(storage_index);
+
+        // Ensure segment is loaded
+        super::segments::ensure_filter_data_segment_loaded(self, segment_id).await?;
+
+        // Update segment
+        {
+            let mut segments = self.active_filter_data_segments.write().await;
+            if let Some(segment) = segments.get_mut(&segment_id) {
+                // Ensure index has space
+                while segment.index.len() <= offset {
+                    segment.index.push(FilterDataIndexEntry::default());
+                }
+
+                // Calculate offset for this filter's data
+                let data_offset = segment.current_data_size;
+
+                // Update index entry
+                segment.index[offset] = FilterDataIndexEntry {
+                    offset: data_offset,
+                    length: filter.len() as u32,
+                };
+
+                // Store filter in cache
+                segment.filters.insert(offset, filter.to_vec());
+                segment.current_data_size += filter.len() as u64;
+                segment.filter_count = segment.index.iter().filter(|e| e.length > 0).count();
+
+                segment.state = SegmentState::Dirty;
+                segment.last_accessed = std::time::Instant::now();
+            }
+        }
+
+        // Save dirty segments periodically
+        if height.is_multiple_of(100) {
+            super::segments::save_dirty_segments(self).await?;
+        }
+
         Ok(())
     }
 
-    /// Load a compact filter.
+    /// Load a compact filter using segmented storage.
     pub async fn load_filter(&self, height: u32) -> StorageResult<Option<Vec<u8>>> {
-        let path = self.base_path.join(format!("filters/{}.dat", height));
-        if !path.exists() {
-            return Ok(None);
+        let sync_base_height = *self.sync_base_height.read().await;
+
+        // Convert blockchain height to storage index
+        let storage_index = if sync_base_height > 0 && height >= sync_base_height {
+            height - sync_base_height
+        } else {
+            height
+        };
+
+        let segment_id = Self::get_filter_segment_id(storage_index);
+        let offset = Self::get_filter_segment_offset(storage_index);
+
+        // First check in-memory cache (segment may not be saved to disk yet)
+        {
+            let segments = self.active_filter_data_segments.read().await;
+            if let Some(segment) = segments.get(&segment_id) {
+                // Check if filter exists in index
+                if offset < segment.index.len() && segment.index[offset].length > 0 {
+                    // Check if filter is cached in memory
+                    if let Some(filter) = segment.filters.get(&offset) {
+                        return Ok(Some(filter.clone()));
+                    }
+
+                    // Filter is in index but not cached - load from combined segment file
+                    let entry = &segment.index[offset];
+                    let file_data_offset = segment.file_data_offset;
+                    let segment_path = self
+                        .base_path
+                        .join(format!("filters/filter_data_segment_{:04}.seg", segment_id));
+                    if segment_path.exists() {
+                        let filter = super::io::load_filter_data_at_offset(
+                            &segment_path,
+                            entry.offset,
+                            file_data_offset,
+                            entry.length,
+                        )
+                        .await?;
+                        return Ok(Some(filter));
+                    }
+                }
+            }
         }
 
-        let data = tokio::fs::read(path).await?;
-        Ok(Some(data))
+        // Try loading from disk if segment not in memory
+        let segment_path =
+            self.base_path.join(format!("filters/filter_data_segment_{:04}.seg", segment_id));
+
+        if segment_path.exists() {
+            let (index, data_offset) = super::io::load_filter_data_index(&segment_path).await?;
+            if offset < index.len() && index[offset].length > 0 {
+                let entry = &index[offset];
+                let filter = super::io::load_filter_data_at_offset(
+                    &segment_path,
+                    entry.offset,
+                    data_offset,
+                    entry.length,
+                )
+                .await?;
+                return Ok(Some(filter));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Clear all filter data.
@@ -207,6 +311,7 @@ impl DiskStorageManager {
 
         // Clear in-memory filter state
         self.active_filter_segments.write().await.clear();
+        self.active_filter_data_segments.write().await.clear();
         *self.cached_filter_tip_height.write().await = None;
 
         // Remove filter headers and compact filter files
