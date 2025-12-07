@@ -3,8 +3,8 @@
 #include "../include/dash_spv_ffi.h"
 
 int main() {
-    // Initialize logging
-    if (dash_spv_ffi_init_logging("info") != 0) {
+    // Initialize logging (console only, no file logging)
+    if (dash_spv_ffi_init_logging("info", true, NULL, 0) != 0) {
         fprintf(stderr, "Failed to initialize logging\n");
         return 1;
     }
